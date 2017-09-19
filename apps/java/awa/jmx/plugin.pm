@@ -31,9 +31,9 @@ sub new {
 
     $self->{version} = '0.1';
     %{ $self->{modes} } = (
-        'agents'  => 'apps::java::awa::jmx::mode::agents',
-        'queues'  => 'apps::java::awa::jmx::mode::queues',
-        'servers' => 'apps::java::awa::jmx::mode::servers',
+        'agent'  => 'apps::java::awa::jmx::mode::agent',
+        'queue'  => 'apps::java::awa::jmx::mode::queue',
+        'server' => 'apps::java::awa::jmx::mode::server',
     );
 
     $self->{custom_modes}{jolokia} = 'centreon::common::protocols::jmx::custom::jolokia';

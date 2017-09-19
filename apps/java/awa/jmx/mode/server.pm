@@ -18,7 +18,7 @@
 # limitations under the License.
 #
 
-package apps::java::awa::jmx::mode::servers;
+package apps::java::awa::jmx::mode::server;
 
 use base qw(centreon::plugins::templates::counter);
 
