@@ -37,7 +37,6 @@ sub new {
     );
 
     $self->{custom_modes}{jolokia} = 'centreon::common::protocols::jmx::custom::jolokia';
-
     return $self;
 }
 
@@ -47,6 +46,6 @@ __END__
 
 =head1 PLUGIN DESCRIPTION
 
-Check Awa in JMX. Need Jolokia agent.
+Check Automic Workload Automation (Awa) in JMX. Need Jolokia agent.
 
 =cut

@@ -24,6 +24,85 @@ use base qw(centreon::plugins::templates::counter);
 
 use strict;
 use warnings;
+use centreon::plugins::misc;
+
+my $instance_mode;
+
+sub custom_status_threshold {
+    my ($self, %options) = @_;
+    my $status = 'ok';
+    my $message;
+
+    eval {
+        local $SIG{__WARN__} = sub { $message = $_[0]; };
+        local $SIG{__DIE__}  = sub { $message = $_[0]; };
+
+        if (   defined($instance_mode->{option_results}->{critical_status})
+            && $instance_mode->{option_results}->{critical_status} ne ''
+            && eval "$instance_mode->{option_results}->{critical_status}")
+        {
+            $status = 'critical';
+        }
+        elsif (defined($instance_mode->{option_results}->{warning_status})
+            && $instance_mode->{option_results}->{warning_status} ne ''
+            && eval "$instance_mode->{option_results}->{warning_status}")
+        {
+            $status = 'warning';
+        }
+    };
+    if (defined($message)) {
+        $self->{output}->output_add(long_msg => 'filter status issue: ' . $message);
+    }
+
+    return $status;
+}
+
+sub custom_status_output {
+    my ($self, %options) = @_;
+
+    my $msg
+        = 'active : '
+        . $self->{result_values}->{active}
+        . '[IpAddress: '
+        . $self->{result_values}->{ipaddress} . ' ]';
+    return $msg;
+}
+
+sub custom_status_calc {
+    my ($self, %options) = @_;
+
+    $self->{result_values}->{ipaddress} = $options{new_datas}->{ $self->{instance} . '_ipaddress' };
+    $self->{result_values}->{active}    = $options{new_datas}->{ $self->{instance} . '_active' };
+    $self->{result_values}->{display}   = $options{new_datas}->{ $self->{instance} . '_display' };
+    return 0;
+}
+
+sub set_counters {
+    my ($self, %options) = @_;
+
+    $self->{maps_counters_type} = [
+        {   name             => 'server',
+            type             => 1,
+            cb_prefix_output => 'prefix_server_output',
+            message_multiple => 'All servers are ok',
+            skipped_code     => { -10 => 1 }
+        },
+    ];
+
+    $self->{maps_counters}->{server} = [
+        {   label     => 'status',
+            threshold => 0,
+            set       => {
+                key_values =>
+                    [ { name => 'active' }, { name => 'ipaddress' }, { name => 'display' } ],
+                closure_custom_calc            => $self->can('custom_status_calc'),
+                closure_custom_output          => $self->can('custom_status_output'),
+                closure_custom_perfdata        => sub { return 0; },
+                closure_custom_threshold_check => $self->can('custom_status_threshold'),
+            }
+        },
+    ];
+}
 
 sub new {
     my ($class, %options) = @_;
@@ -33,166 +112,83 @@ sub new {
     $self->{version} = '1.0';
     $options{options}->add_options(
         arguments => {
-            "server-name:s" => {
-                name    => 'server_name',
-                default => 'NAME'
-            },
+            "filter-name:s"     => { name => 'filter_name' },
+            "warning-status:s"  => { name => 'warning_status', default => '' },
+            "critical-status:s" => { name => 'critical_status', default => '' },
         }
     );
 
     return $self;
 }
 
-sub disco_format {
+sub check_options {
     my ($self, %options) = @_;
+    $self->SUPER::check_options(%options);
 
-    my $attributs = [ 'name', 'side', 'type' ];
-    $self->{output}->add_disco_format(elements => $attributs);
-
-    return;
+    $instance_mode = $self;
+    $self->change_macros();
 }
 
-sub disco_show {
+sub change_macros {
     my ($self, %options) = @_;
 
-    $self->manage_selection(%options);
+    foreach (('warning_status', 'critical_status')) {
+        if (defined($self->{option_results}->{$_})) {
+            $self->{option_results}->{$_} =~ s/%\{(.*?)\}/\$self->{result_values}->{$1}/g;
+        }
+    }
+}
 
-    return;
+sub prefix_server_output {
+    my ($self, %options) = @_;
+
+    return "Server '" . $options{instance_value}->{display} . "' ";
 }
 
 sub manage_selection {
     my ($self, %options) = @_;
 
-    $options{'disco_show'} = $options{'custom'}{'output'}{'option_results'}{'disco_show'};
-
+    $self->{app}     = {};
     $self->{request} = [
-        {   mbean      => 'Automic:name=*,type=*,side=Servers',
-            attributes => [ { name => 'Active' }, { name => 'Name' }, { name => 'IpAddress' }, ]
+        {   mbean      => 'Automic:name=*,side=Servers,type=*',
+            attributes => [
+                { name => 'NetArea' },
+                { name => 'IpAddress' },
+                { name => 'Active' },
+                { name => 'Name' }
+            ]
         },
     ];
-
     my $result = $options{custom}->get_attributes(request => $self->{request}, nothing_quit => 1);
 
-    my $app;
     foreach my $mbean (keys %{$result}) {
-        $mbean =~ /Automic:name=(.*?),side=(.*),type=(.*)/;
-        my $app  = defined($1) ? $1 : 'global';
-        my $side = defined($2) ? $2 : 'global';
-        my $type = defined($3) ? $3 : 'global';
+        $mbean =~ /name=(.*?)(,|$)/i;
+        my $name = $1;
+        $mbean =~ /type=(.*?)(,|$)/i;
+        my $display = $1 . '.' . $name;
 
-        if ($options{'disco_show'}) {
-
-            $self->{'app'}->{$app} = {
-                'display'     => $app,
-                'mbean_infos' => {
-                    'side' => $side,
-                    'type' => $type,
-                },
-            };
-            next;
-        }
-
-        if (   (defined($self->{'option_results'}{'server_name'}))
-            && ($self->{'option_results'}{'server_name'} ne '')
-            && ($app !~ /$self->{'option_results'}{'server_name'}/)
-            && (!defined($options{'disco_show'})))
+        if (   defined($self->{option_results}->{filter_name})
+            && $self->{option_results}->{filter_name} ne ''
+            && $display !~ /$self->{option_results}->{filter_name}/)
         {
+            $self->{output}->output_add(
+                long_msg => "skipping '" . $display . "': no matching filter.",
+                debug    => 1
+            );
             next;
         }
 
-        $self->{'app'}->{$app} = {
-            'display'     => $app,
-            'Active'      => $result->{$mbean}->{'Active'},
-            'Name'        => $result->{$mbean}->{'Name'},
-            'IpAddress'   => $result->{$mbean}->{'IpAddress'},
-            'mbean_infos' => {
-                'side' => $side,
-                'type' => $type,
-            },
+        $self->{server}->{$display} = {
+            display   => $display,
+            ipaddress => $result->{$mbean}->{IpAddress},
+            active    => $result->{$mbean}->{Active} ? 'yes' : 'no',
         };
     }
 
-    if (defined($options{'disco_show'})) {
-
-        foreach my $key (keys %{ $self->{'app'} }) {
-            $self->{output}->add_disco_entry(
-                'name' => $key,
-                'type' => $self->{'app'}->{$key}->{'mbean_infos'}->{'type'},
-                'side' => $self->{'app'}->{$key}->{'mbean_infos'}->{'side'},
-            );
-        }
-        return;
+    if (scalar(keys %{ $self->{server} }) <= 0) {
+        $self->{output}->add_option_msg(short_msg => "No server found.");
+        $self->{output}->option_exit();
     }
-
-    my $expected_name = undef;
-
-    if (   (defined($self->{'option_results'}{'server_name'}))
-        && ($self->{'option_results'}{'server_name'} ne ''))
-    {
-        $expected_name = $self->{'option_results'}{'server_name'};
-    }
-
-    # start algo
-    my ($extented_status_information, $status_information, $severity,);
-
-    if (scalar(keys %{ $self->{app} }) <= 0) {
-
-        $status_information = "Server ($expected_name) No found\n";
-        $severity           = 'CRITICAL';
-        $self->{output}->output_add(
-            severity  => $severity,
-            short_msg => $status_information,
-            long_msg  => $extented_status_information,
-        );
-        $self->{output}->display();
-        $self->{output}->exit();
-
-        return;
-    }
-
-    my $v = JMX::Jmx4Perl::Util->dump_value($self->{'app'}->{$expected_name}->{'Active'},
-        { format => 'DATA' });
-    $v =~ s/^\s*//;
-    $v =~ s/'//g;
-    $v =~ s/\[//;
-    $v =~ s/\]//;
-    chomp($v);
-
-    my $hash = {
-        'Active'    => $v,
-        'Name'      => $self->{'app'}->{$expected_name}->{'Name'},
-        'IpAddress' => $self->{'app'}->{$expected_name}->{'IpAddress'},
-        'display'   => $self->{'app'}->{$expected_name}->{'display'},
-        'type'      => $self->{'app'}->{$expected_name}->{'mbean_infos'}->{'type'},
-        'side'      => $self->{'app'}->{$expected_name}->{'mbean_infos'}->{'side'},
-    };
-
-    if ($hash->{'Active'} eq 'true') {
-        $status_information = "Server $hash->{'Name'} is started.";
-        $status_information .= " Server is OK.\n";
-        $severity = 'OK';
-    }
-    elsif ($hash->{'Active'} eq 'false') {
-        $status_information          = "Server $hash->{'Name'} is not started.\n";
-        $extented_status_information = "Server: $hash->{'IpAddress'}\n";
-        $extented_status_information .= "Name: $hash->{'Name'}\n";
-        $extented_status_information .= "Env:  $hash->{'type'}\n";
-        $severity = 'CRITICAL';
-    }
-    else {
-        $status_information = "Case not implemented";
-        $severity           = 'CRITICAL';
-    }
-
-    $self->{output}->output_add(
-        severity  => $severity,
-        short_msg => $status_information,
-        long_msg  => $extented_status_information,
-    );
-    $self->{output}->display();
-    $self->{output}->exit();
-
-    return;
 }
 
 1;
@@ -201,13 +197,23 @@ __END__
 
 =head1 MODE
 
-Server Monitoring.
+Check server status.
 
 =over 8
 
-=item B<--server-name>
+=item B<--filter-name>
 
-Name of server (Default: 'NAME').
+Filter server name (can be a regexp).
+
+=item B<--warning-status>
+
+Set warning threshold for status (Default: '').
+Can used special variables like: %{display}, %{ipaddress}, %{active}
+
+=item B<--critical-status>
+
+Set critical threshold for status (Default: '').
+Can used special variables like: %{display}, %{ipaddress}, %{active}
 
 =back
 

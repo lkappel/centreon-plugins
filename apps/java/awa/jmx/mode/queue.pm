@@ -25,6 +25,78 @@ use base qw(centreon::plugins::templates::counter);
 use strict;
 use warnings;
 
+my $instance_mode;
+
+sub custom_status_threshold {
+    my ($self, %options) = @_;
+    my $status = 'ok';
+    my $message;
+
+    eval {
+        local $SIG{__WARN__} = sub { $message = $_[0]; };
+        local $SIG{__DIE__}  = sub { $message = $_[0]; };
+
+        if (   defined($instance_mode->{option_results}->{critical_status})
+            && $instance_mode->{option_results}->{critical_status} ne ''
+            && eval "$instance_mode->{option_results}->{critical_status}")
+        {
+            $status = 'critical';
+        }
+        elsif (defined($instance_mode->{option_results}->{warning_status})
+            && $instance_mode->{option_results}->{warning_status} ne ''
+            && eval "$instance_mode->{option_results}->{warning_status}")
+        {
+            $status = 'warning';
+        }
+    };
+    if (defined($message)) {
+        $self->{output}->output_add(long_msg => 'filter status issue: ' . $message);
+    }
+
+    return $status;
+}
+
+sub custom_status_output {
+    my ($self, %options) = @_;
+
+    my $msg = 'status : ' . $self->{result_values}->{status};
+    return $msg;
+}
+
+sub custom_status_calc {
+    my ($self, %options) = @_;
+
+    $self->{result_values}->{status}  = $options{new_datas}->{ $self->{instance} . '_status' };
+    $self->{result_values}->{display} = $options{new_datas}->{ $self->{instance} . '_display' };
+    return 0;
+}
+
+sub set_counters {
+    my ($self, %options) = @_;
+
+    $self->{maps_counters_type} = [
+        {   name             => 'queue',
+            type             => 1,
+            cb_prefix_output => 'prefix_queue_output',
+            message_multiple => 'All queues are ok',
+            skipped_code     => { -10 => 1 }
+        },
+    ];
+
+    $self->{maps_counters}->{queue} = [
+        {   label     => 'status',
+            threshold => 0,
+            set       => {
+                key_values => [ { name => 'status' }, { name => 'display' } ],
+                closure_custom_calc            => $self->can('custom_status_calc'),
+                closure_custom_output          => $self->can('custom_status_output'),
+                closure_custom_perfdata        => sub { return 0; },
+                closure_custom_threshold_check => $self->can('custom_status_threshold'),
+            }
+        },
+    ];
+}
+
 sub new {
     my ($class, %options) = @_;
     my $self = $class->SUPER::new(package => __PACKAGE__, %options);
@@ -33,155 +105,78 @@ sub new {
     $self->{version} = '1.0';
     $options{options}->add_options(
         arguments => {
-            "queue-name:s" => {
-                name    => 'queue_name',
-                default => 'NAME'
-            },
+            "filter-name:s"    => { name => 'filter_name' },
+            "warning-status:s" => { name => 'warning_status', default => '' },
+            "critical-status:s" =>
+                { name => 'critical_status', default => '%{status} !~ /GREEN/i' },
         }
     );
 
     return $self;
 }
 
-sub disco_format {
+sub check_options {
     my ($self, %options) = @_;
+    $self->SUPER::check_options(%options);
 
-    my $attributs = [ 'name', 'side', 'type' ];
-    $self->{output}->add_disco_format(elements => $attributs);
-
-    return;
+    $instance_mode = $self;
+    $self->change_macros();
 }
 
-sub disco_show {
+sub change_macros {
     my ($self, %options) = @_;
 
-    $self->manage_selection(%options);
+    foreach (('warning_status', 'critical_status')) {
+        if (defined($self->{option_results}->{$_})) {
+            $self->{option_results}->{$_} =~ s/%\{(.*?)\}/\$self->{result_values}->{$1}/g;
+        }
+    }
+}
 
-    return;
+sub prefix_queue_output {
+    my ($self, %options) = @_;
+
+    return "Queue '" . $options{instance_value}->{display} . "' ";
 }
 
 sub manage_selection {
     my ($self, %options) = @_;
 
-    $options{'disco_show'} = $options{'custom'}{'output'}{'option_results'}{'disco_show'};
-
+    $self->{app}     = {};
     $self->{request} = [
-        {   mbean      => 'Automic:name=*,type=*,side=Queues',
-            attributes => [ { name => 'Status' }, { name => 'Name' }, ]
+        {   mbean      => 'Automic:name=*,side=Queues,type=*',
+            attributes => [ { name => 'Status' }, { name => 'Name' } ]
         },
     ];
-
     my $result = $options{custom}->get_attributes(request => $self->{request}, nothing_quit => 1);
 
-    my $app;
     foreach my $mbean (keys %{$result}) {
-        $mbean =~ /Automic:name=(.*?),side=(.*),type=(.*)/;
-        my $app  = defined($1) ? $1 : 'global';
-        my $side = defined($2) ? $2 : 'global';
-        my $type = defined($3) ? $3 : 'global';
+        $mbean =~ /name=(.*?)(,|$)/i;
+        my $name = $1;
+        $mbean =~ /type=(.*?)(,|$)/i;
+        my $display = $1 . '.' . $name;
 
-        if ($options{'disco_show'}) {
-
-            $self->{'app'}->{$app} = {
-                'display'     => $app,
-                'mbean_infos' => {
-                    'side' => $side,
-                    'type' => $type,
-                },
-            };
-            next;
-        }
-
-        if (   (defined($self->{'option_results'}{'queue_name'}))
-            && ($self->{'option_results'}{'queue_name'} ne '')
-            && ($app !~ /$self->{'option_results'}{'queue_name'}/)
-            && (!defined($options{'disco_show'})))
+        if (   defined($self->{option_results}->{filter_name})
+            && $self->{option_results}->{filter_name} ne ''
+            && $display !~ /$self->{option_results}->{filter_name}/)
         {
+            $self->{output}->output_add(
+                long_msg => "skipping '" . $display . "': no matching filter.",
+                debug    => 1
+            );
             next;
         }
 
-        $self->{'app'}->{$app} = {
-            'display'     => $app,
-            'Status'      => $result->{$mbean}->{'Status'},
-            'Name'        => $result->{$mbean}->{'Name'},
-            'mbean_infos' => {
-                'side' => $side,
-                'type' => $type,
-            },
+        $self->{queue}->{$display} = {
+            display => $display,
+            status  => $result->{$mbean}->{Status},
         };
     }
 
-    if (defined($options{'disco_show'})) {
-
-        foreach my $key (keys %{ $self->{'app'} }) {
-            $self->{output}->add_disco_entry(
-                'name' => $key,
-                'type' => $self->{'app'}->{$key}->{'mbean_infos'}->{'type'},
-                'side' => $self->{'app'}->{$key}->{'mbean_infos'}->{'side'},
-            );
-        }
-        return;
+    if (scalar(keys %{ $self->{queue} }) <= 0) {
+        $self->{output}->add_option_msg(short_msg => "No queue found.");
+        $self->{output}->option_exit();
     }
-
-    my $expected_name = undef;
-
-    if (   (defined($self->{'option_results'}{'queue_name'}))
-        && ($self->{'option_results'}{'queue_name'} ne ''))
-    {
-        $expected_name = $self->{'option_results'}{'queue_name'};
-    }
-
-    # start algo
-    my ($extented_status_information, $status_information, $severity,);
-
-    if (scalar(keys %{ $self->{app} }) <= 0) {
-
-        $status_information = "Queue ($expected_name) No found\n";
-        $severity           = 'CRITICAL';
-        $self->{output}->output_add(
-            severity  => $severity,
-            short_msg => $status_information,
-            long_msg  => $extented_status_information,
-        );
-        $self->{output}->display();
-        $self->{output}->exit();
-
-        return;
-    }
-
-    my $hash = {
-        'Status'  => $self->{'app'}->{$expected_name}->{'Status'},
-        'Name'    => $self->{'app'}->{$expected_name}->{'Name'},
-        'display' => $self->{'app'}->{$expected_name}->{'display'},
-        'type'    => $self->{'app'}->{$expected_name}->{'mbean_infos'}->{'type'},
-        'side'    => $self->{'app'}->{$expected_name}->{'mbean_infos'}->{'side'},
-    };
-
-    if ($hash->{'Status'} eq 'GREEN') {
-        $status_information = "Queue $hash->{'Name'} $hash->{'type'} is Green.";
-        $status_information .= " Queue is OK.\n";
-        $severity = 'OK';
-    }
-    elsif ($hash->{'Status'} eq 'RED') {
-        $status_information          = "Queue is not started\n";
-        $extented_status_information = "Queue: $hash->{'Name'}\n";
-        $extented_status_information .= "Env: $hash->{'type'}\n";
-        $severity = 'CRITICAL';
-    }
-    else {
-        $status_information = "Case not implemented";
-        $severity           = 'CRITICAL';
-    }
-
-    $self->{output}->output_add(
-        severity  => $severity,
-        short_msg => $status_information,
-        long_msg  => $extented_status_information,
-    );
-    $self->{output}->display();
-    $self->{output}->exit();
-
-    return;
 }
 
 1;
@@ -190,13 +185,23 @@ __END__
 
 =head1 MODE
 
-Queue Monitoring.
+Check queue status.
 
 =over 8
 
-=item B<--queue-name>
+=item B<--filter-name>
 
-Name of queue (Default: 'NAME').
+Filter queue name (can be a regexp).
+
+=item B<--warning-status>
+
+Set warning threshold for status (Default: '').
+Can used special variables like: %{display}, %{status}
+
+=item B<--critical-status>
+
+Set critical threshold for status (Default: '%{status} !~ /GREEN/i').
+Can used special variables like: %{display}, %{status}
 
 =back
 

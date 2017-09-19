@@ -24,9 +24,93 @@ use base qw(centreon::plugins::templates::counter);
 
 use strict;
 use warnings;
+use centreon::plugins::misc;
+use DateTime;
 
-use POSIX qw(strftime);
-use Time::Local;
+my $instance_mode;
+
+sub custom_status_threshold {
+    my ($self, %options) = @_;
+    my $status = 'ok';
+    my $message;
+
+    eval {
+        local $SIG{__WARN__} = sub { $message = $_[0]; };
+        local $SIG{__DIE__}  = sub { $message = $_[0]; };
+
+        if (   defined($instance_mode->{option_results}->{critical_status})
+            && $instance_mode->{option_results}->{critical_status} ne ''
+            && eval "$instance_mode->{option_results}->{critical_status}")
+        {
+            $status = 'critical';
+        }
+        elsif (defined($instance_mode->{option_results}->{warning_status})
+            && $instance_mode->{option_results}->{warning_status} ne ''
+            && eval "$instance_mode->{option_results}->{warning_status}")
+        {
+            $status = 'warning';
+        }
+    };
+    if (defined($message)) {
+        $self->{output}->output_add(long_msg => 'filter status issue: ' . $message);
+    }
+
+    return $status;
+}
+
+sub custom_status_output {
+    my ($self, %options) = @_;
+
+    my $msg
+        = 'active : '
+        . $self->{result_values}->{active}
+        . '[IpAddress: '
+        . $self->{result_values}->{ipaddress} . ' ]'
+        . '[LastCheck: '
+        . centreon::plugins::misc::change_seconds(value => $self->{result_values}->{since}) . ']';
+    return $msg;
+}
+
+sub custom_status_calc {
+    my ($self, %options) = @_;
+
+    $self->{result_values}->{since}     = $options{new_datas}->{ $self->{instance} . '_since' };
+    $self->{result_values}->{ipaddress} = $options{new_datas}->{ $self->{instance} . '_ipaddress' };
+    $self->{result_values}->{active}    = $options{new_datas}->{ $self->{instance} . '_active' };
+    $self->{result_values}->{display}   = $options{new_datas}->{ $self->{instance} . '_display' };
+    return 0;
+}
+
+sub set_counters {
+    my ($self, %options) = @_;
+
+    $self->{maps_counters_type} = [
+        {   name             => 'agent',
+            type             => 1,
+            cb_prefix_output => 'prefix_agent_output',
+            message_multiple => 'All agents are ok',
+            skipped_code     => { -10 => 1 }
+        },
+    ];
+
+    $self->{maps_counters}->{agent} = [
+        {   label     => 'status',
+            threshold => 0,
+            set       => {
+                key_values => [
+                    { name => 'active' },
+                    { name => 'ipaddress' },
+                    { name => 'since' },
+                    { name => 'display' }
+                ],
+                closure_custom_calc            => $self->can('custom_status_calc'),
+                closure_custom_output          => $self->can('custom_status_output'),
+                closure_custom_perfdata        => sub { return 0; },
+                closure_custom_threshold_check => $self->can('custom_status_threshold'),
+            }
+        },
+    ];
+}
 
 sub new {
     my ($class, %options) = @_;
@@ -36,212 +120,100 @@ sub new {
     $self->{version} = '1.0';
     $options{options}->add_options(
         arguments => {
-            "max-lastcheck:s" => { name => 'max_lastcheck', default => 200 },
-            "agent-name:s"    => {
-                name    => 'agent_name',
-                default => 'NAME',
-            },
+            "filter-name:s"     => { name => 'filter_name' },
+            "warning-status:s"  => { name => 'warning_status', default => '' },
+            "critical-status:s" => { name => 'critical_status', default => '' },
+            "timezone:s"        => { name => 'timezone' },
         }
     );
 
     return $self;
 }
 
-sub epoch_time {
-    my ($self, $date) = @_;
+sub check_options {
+    my ($self, %options) = @_;
+    $self->SUPER::check_options(%options);
 
-    my ($year, $month, $day, $hour, $min, $sec) = split /\W+/, $date;
-    my $time = timelocal($sec, $min, $hour, $day, $month - 1, $year);
-
-    return $time;
+    $instance_mode = $self;
+    $self->change_macros();
+    $self->{option_results}->{timezone} = 'GMT'
+        if (!defined($self->{option_results}->{timezone})
+        || $self->{option_results}->{timezone} eq '');
 }
 
-sub disco_format {
+sub change_macros {
     my ($self, %options) = @_;
 
-    my $attributs = [ 'name', 'side', 'type' ];
-    $self->{output}->add_disco_format(elements => $attributs);
-
-    return;
+    foreach (('warning_status', 'critical_status')) {
+        if (defined($self->{option_results}->{$_})) {
+            $self->{option_results}->{$_} =~ s/%\{(.*?)\}/\$self->{result_values}->{$1}/g;
+        }
+    }
 }
 
-sub disco_show {
+sub prefix_agent_output {
     my ($self, %options) = @_;
 
-    $self->manage_selection(%options);
-
-    return;
+    return "Agent '" . $options{instance_value}->{display} . "' ";
 }
 
 sub manage_selection {
     my ($self, %options) = @_;
 
-    $options{'disco_show'} = $options{'custom'}{'output'}{'option_results'}{'disco_show'};
-
+    $self->{app}     = {};
     $self->{request} = [
-        {   mbean      => 'Automic:name=*,type=*,side=Agents',
+        {   mbean      => 'Automic:name=*,side=Agents,type=*',
             attributes => [
-                { name => 'Active' },
-                { name => 'Name' },
-                { name => 'IpAddress' },
                 { name => 'LastCheck' },
-                { name => 'NetArea' },
+                { name => 'IpAddress' },
+                { name => 'Active' },
+                { name => 'Name' }
             ]
         },
     ];
-
     my $result = $options{custom}->get_attributes(request => $self->{request}, nothing_quit => 1);
 
-    my $app;
     foreach my $mbean (keys %{$result}) {
-        $mbean =~ /Automic:name=(.*?),side=(.*),type=(.*)/;
-        my $app  = defined($1) ? $1 : 'global';
-        my $side = defined($2) ? $2 : 'global';
-        my $type = defined($3) ? $3 : 'global';
+        $mbean =~ /name=(.*?)(,|$)/i;
+        my $name = $1;
+        $mbean =~ /type=(.*?)(,|$)/i;
+        my $display = $1 . '.' . $name;
 
-        if ($options{'disco_show'}) {
-
-            $self->{'app'}->{$app} = {
-                'display'     => $app,
-                'mbean_infos' => {
-                    'side' => $side,
-                    'type' => $type,
-                },
-            };
-            next;
-        }
-
-        if (   (defined($self->{'option_results'}{'agent_name'}))
-            && ($self->{'option_results'}{'agent_name'} ne '')
-            && ($app !~ /$self->{'option_results'}{'agent_name'}/)
-            && (!defined($options{'disco_show'})))
+        if (   defined($self->{option_results}->{filter_name})
+            && $self->{option_results}->{filter_name} ne ''
+            && $display !~ /$self->{option_results}->{filter_name}/)
         {
+            $self->{output}->output_add(
+                long_msg => "skipping '" . $display . "': no matching filter.",
+                debug    => 1
+            );
             next;
         }
 
-        $self->{'app'}->{$app} = {
-            'display'     => $app,
-            'Active'      => $result->{$mbean}->{'Active'},
-            'Name'        => $result->{$mbean}->{'Name'},
-            'LastCheck'   => $result->{$mbean}->{'LastCheck'},
-            'NetArea'     => $result->{$mbean}->{'NetArea'},
-            'mbean_infos' => {
-                'side' => $side,
-                'type' => $type,
-            },
+        next if ($result->{$mbean}->{LastCheck} !~ /^\s*(\d+)-(\d+)-(\d+)\s+(\d+):(\d+):(\d+)/);
+
+        my $dt = DateTime->new(
+            year      => $1,
+            month     => $2,
+            day       => $3,
+            hour      => $4,
+            minute    => $5,
+            second    => $6,
+            time_zone => $self->{option_results}->{timezone},
+        );
+
+        $self->{agent}->{$display} = {
+            display   => $display,
+            ipaddress => $result->{$mbean}->{IpAddress},
+            active    => $result->{$mbean}->{Active} ? 'yes' : 'no',
+            since     => time() - $dt->epoch,
         };
     }
 
-    if (defined($options{'disco_show'})) {
-
-        foreach my $key (keys %{ $self->{'app'} }) {
-            $self->{output}->add_disco_entry(
-                'name' => $key,
-                'type' => $self->{'app'}->{$key}->{'mbean_infos'}->{'type'},
-                'side' => $self->{'app'}->{$key}->{'mbean_infos'}->{'side'},
-            );
-        }
-        return;
+    if (scalar(keys %{ $self->{agent} }) <= 0) {
+        $self->{output}->add_option_msg(short_msg => "No agent found.");
+        $self->{output}->option_exit();
     }
-
-    my $expected_name = undef;
-
-    if (   (defined($self->{'option_results'}{'agent_name'}))
-        && ($self->{'option_results'}{'agent_name'} ne ''))
-    {
-        $expected_name = $self->{'option_results'}{'agent_name'};
-    }
-
-    # start algo
-    my ($extented_status_information, $status_information, $severity,);
-
-    if (scalar(keys %{ $self->{app} }) <= 0) {
-
-        $status_information = "Agent ($expected_name) No found\n";
-        $severity           = 'CRITICAL';
-        $self->{output}->output_add(
-            severity  => $severity,
-            short_msg => $status_information,
-            long_msg  => $extented_status_information,
-        );
-        $self->{output}->display();
-        $self->{output}->exit();
-
-        return;
-    }
-
-    my $v = JMX::Jmx4Perl::Util->dump_value($self->{'app'}->{$expected_name}->{'Active'},
-        { format => 'DATA' });
-    $v =~ s/^\s*//;
-    $v =~ s/'//g;
-    $v =~ s/\[//;
-    $v =~ s/\]//;
-    chomp($v);
-
-    my $hash = {
-        'max_lastcheck' => $self->{'option_results'}{'max_lastcheck'},
-        'delta'         => $self->epoch_time(strftime "%Y-%m-%d %H:%M:%S", localtime)
-            - $self->epoch_time($self->{'app'}->{$expected_name}->{'LastCheck'}),
-        'NetArea' => $self->{'app'}->{$expected_name}->{'NetArea'},
-        'Active'  => $v,
-        'Name'    => $self->{'app'}->{$expected_name}->{'Name'},
-        'display' => $self->{'app'}->{$expected_name}->{'display'},
-        'type'    => $self->{'app'}->{$expected_name}->{'mbean_infos'}->{'type'},
-        'side'    => $self->{'app'}->{$expected_name}->{'mbean_infos'}->{'side'},
-    };
-
-    if (    ($hash->{'delta'} < $hash->{'max_lastcheck'})
-        and ($v eq 'true'))
-    {
-        $status_information
-            = "Lastcheck ($hash->{'delta'}s) is fewer than $hash->{'max_lastcheck'} seconds.";
-        $status_information .= " Agent is OK.\n";
-        $severity = 'OK';
-    }
-    elsif ( ($hash->{'delta'} < $hash->{'max_lastcheck'})
-        and ($hash->{'Active'} eq 'false'))
-    {
-        $status_information
-            = "Lastcheck ($hash->{'delta'}s) is fewer than $hash->{'max_lastcheck'} seconds.";
-        $status_information .= " Agent is not active.\n";
-        $extented_status_information = "Server : $hash->{'IpAddress'}\n";
-        $extented_status_information .= "Agent : $hash->{'Name'}\n";
-        $extented_status_information .= "Env : $hash->{'NetArea'}\n";
-        $severity = 'CRITICAL';
-    }
-    elsif ( ($hash->{'delta'} >= $hash->{'max_lastcheck'})
-        and ($hash->{'Active'} eq 'true'))
-    {
-        $status_information
-            = "Lastcheck ($hash->{'delta'}s) is greater than $hash->{'max_lastcheck'} seconds.";
-        $status_information .= " Agent is OK.\n";
-        $severity = 'CRITICAL';
-    }
-    elsif ( ($hash->{'delta'} >= $hash->{'max_lastcheck'})
-        and ($hash->{'Active'} eq 'false'))
-    {
-        $status_information
-            = "Lastcheck ($hash->{'delta'}s) is greater than $hash->{'max_lastcheck'} seconds.";
-        $status_information .= " Agent is not active.\n";
-        $extented_status_information = "Server : $hash->{'IpAddress'}\n";
-        $extented_status_information .= "Agent : $hash->{'Name'}\n";
-        $extented_status_information .= "Env : $hash->{'NetArea'}\n";
-        $severity = 'CRITICAL';
-    }
-    else {
-        $status_information = "Case not implemented";
-        $severity           = 'CRITICAL';
-    }
-
-    $self->{output}->output_add(
-        severity  => $severity,
-        short_msg => $status_information,
-        long_msg  => $extented_status_information,
-    );
-    $self->{output}->display();
-    $self->{output}->exit();
-
-    return;
 }
 
 1;
@@ -249,18 +221,28 @@ sub manage_selection {
 __END__
 
 =head1 MODE
-    
-Agent Monitoring.
+
+Check agent status.
 
 =over 8
 
-=item B<--agent-name>
+=item B<--filter-name>
 
-Name of agent (Default: 'NAME').
+Filter agent name (can be a regexp).
 
-=item B<--max-lastcheck>
+=item B<--warning-status>
 
-Maximum last check time (default: 200)
+Set warning threshold for status (Default: '').
+Can used special variables like: %{since}, %{display}, %{ipaddress}, %{active}
+
+=item B<--critical-status>
+
+Set critical threshold for status (Default: '').
+Can used special variables like: %{since}, %{display}, %{ipaddress}, %{active}
+
+=item B<--timezone>
+
+Timezone options (the date from the equipment overload that option). Default is 'GMT'.
 
 =back
 
